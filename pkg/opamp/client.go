@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	opampclient "github.com/open-telemetry/opamp-go/client"
@@ -134,13 +135,31 @@ func (c *Client) Stop() {
 	}
 }
 
-// SetHealth updates the health status reported to the server.
-func (c *Client) SetHealth(health api.HealthStatus, totalPods, readyPods int) error {
+// PodHealth holds per-pod status for topology reporting.
+type PodHealth struct {
+	Name  string
+	Node  string
+	IP    string
+	Ready bool
+	Phase string
+}
+
+// SetHealth updates the health status with per-pod topology.
+func (c *Client) SetHealth(health api.HealthStatus, pods []PodHealth) error {
 	if c.client == nil {
 		return fmt.Errorf("client not started")
 	}
 
+	ready := 0
+	for _, p := range pods {
+		if p.Ready {
+			ready++
+		}
+	}
+	total := len(pods)
 	healthy := health == api.HealthHealthy
+
+	// Build component health map: one entry per pod + fleet summary
 	componentHealthMap := map[string]*protobufs.ComponentHealth{
 		"fleet": {
 			Healthy:            healthy,
@@ -149,14 +168,23 @@ func (c *Client) SetHealth(health api.HealthStatus, totalPods, readyPods int) er
 			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
 				"total_pods": {
 					Healthy: true,
-					Status:  fmt.Sprintf("%d", totalPods),
+					Status:  fmt.Sprintf("%d", total),
 				},
 				"ready_pods": {
-					Healthy: readyPods == totalPods,
-					Status:  fmt.Sprintf("%d", readyPods),
+					Healthy: ready == total,
+					Status:  fmt.Sprintf("%d", ready),
 				},
 			},
 		},
+	}
+
+	// Add each pod as a component for topology visibility
+	for _, p := range pods {
+		status := fmt.Sprintf("node=%s ip=%s phase=%s", p.Node, p.IP, p.Phase)
+		componentHealthMap["pod/"+p.Name] = &protobufs.ComponentHealth{
+			Healthy: p.Ready,
+			Status:  status,
+		}
 	}
 
 	return c.client.SetHealth(&protobufs.ComponentHealth{
@@ -257,6 +285,7 @@ func (c *Client) getEffectiveConfig() *protobufs.EffectiveConfig {
 
 // onMessage handles incoming server messages.
 func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
+	// Handle normal config updates
 	if msg.RemoteConfig != nil && c.onConfigUpdate != nil {
 		cfg := msg.RemoteConfig.Config
 		if cfg != nil {
@@ -267,6 +296,28 @@ func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
 				})
 				break
 			}
+		}
+	}
+
+	// Handle emergency override commands via custom messages
+	if msg.CustomMessage != nil && c.onEmergencyCmd != nil {
+		cm := msg.CustomMessage
+		if strings.EqualFold(cm.Type, "emergency") && strings.EqualFold(cm.Capability, "collectorctrl") {
+			// Parse emergency command from custom message data
+			// Format: "emergency:<reason>\n---\n<configYAML>"
+			data := string(cm.Data)
+			parts := strings.SplitN(data, "\n---\n", 2)
+			reason := "emergency override"
+			configYAML := data
+			if len(parts) == 2 {
+				reason = strings.TrimPrefix(parts[0], "emergency:")
+				reason = strings.TrimSpace(reason)
+				configYAML = parts[1]
+			}
+			c.onEmergencyCmd(EmergencyCommand{
+				ConfigYAML: configYAML,
+				Reason:     reason,
+			})
 		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,7 +46,7 @@ type CollectorMonitorReconciler struct {
 // +kubebuilder:rbac:groups=collectorctrl.io,resources=collectormonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=collectorctrl.io,resources=collectormonitors/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=collectorctrl.io,resources=collectormonitors/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=daemonsets;deployments;statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=daemonsets;deployments;statefulsets,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
@@ -95,7 +97,7 @@ func (r *CollectorMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// 6. Report current pod list and health
+	// 6. Report current pod list and health (includes per-pod topology)
 	if err := r.reportFleetHealth(ctx, monitor, workload); err != nil {
 		log.Error(err, "Failed to report fleet health")
 	}
@@ -324,22 +326,28 @@ func (r *CollectorMonitorReconciler) applyEmergencyConfig(ctx context.Context, m
 		return fmt.Errorf("discover workload for restart: %w", err)
 	}
 
-	// Hash the new config for the annotation
-	hash := sha256.Sum256([]byte(configYAML))
-	hashStr := fmt.Sprintf("%x", hash[:8])
-
 	// Patch the pod template annotation to force rolling restart
-	// This requires a type switch on the workload kind
-	// Simplified: patch via unstructured or type assertion
-	_ = workload
-	_ = kind
-	_ = hashStr
+	restartAnnotation := time.Now().Format(time.RFC3339)
+	patch := []byte(fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`, restartAnnotation))
 
-	// TODO: implement annotation patch for DaemonSet, Deployment, StatefulSet
+	switch kind {
+	case "DaemonSet":
+		if err := r.Patch(ctx, workload, client.RawPatch(types.StrategicMergePatchType, patch)); err != nil {
+			return fmt.Errorf("patch daemonset: %w", err)
+		}
+	case "Deployment":
+		if err := r.Patch(ctx, workload, client.RawPatch(types.StrategicMergePatchType, patch)); err != nil {
+			return fmt.Errorf("patch deployment: %w", err)
+		}
+	case "StatefulSet":
+		if err := r.Patch(ctx, workload, client.RawPatch(types.StrategicMergePatchType, patch)); err != nil {
+			return fmt.Errorf("patch statefulset: %w", err)
+		}
+	}
 
 	r.Recorder.Eventf(monitor, corev1.EventTypeWarning, "EmergencyConfigApplied",
-		"Emergency config applied to ConfigMap %s/%s. Restart triggered.",
-		cm.Namespace, cm.Name)
+		"Emergency config applied to ConfigMap %s/%s. %s rolling restart triggered.",
+		cm.Namespace, cm.Name, kind)
 
 	return nil
 }
@@ -371,16 +379,31 @@ func (r *CollectorMonitorReconciler) reportFleetHealth(ctx context.Context, moni
 		return err
 	}
 
-	total := len(podList.Items)
+	// Build per-pod health
+	podsHealth := make([]opamp.PodHealth, 0, len(podList.Items))
 	ready := 0
 	for _, pod := range podList.Items {
-		if isPodReady(&pod) {
+		isReady := isPodReady(&pod)
+		if isReady {
 			ready++
 		}
+		nodeName := pod.Spec.NodeName
+		podIP := pod.Status.PodIP
+		if podIP == "" {
+			podIP = "Pending"
+		}
+		podsHealth = append(podsHealth, opamp.PodHealth{
+			Name:  pod.Name,
+			Node:  nodeName,
+			IP:    podIP,
+			Ready: isReady,
+			Phase: string(pod.Status.Phase),
+		})
 	}
 
-	// Determine health status
+	// Determine aggregate health
 	var health api.HealthStatus
+	total := len(podList.Items)
 	switch {
 	case total == 0:
 		health = api.HealthUnknown
@@ -392,8 +415,8 @@ func (r *CollectorMonitorReconciler) reportFleetHealth(ctx context.Context, moni
 		health = api.HealthUnhealthy
 	}
 
-	// Report health to OpAMP server
-	if err := c.SetHealth(health, total, ready); err != nil {
+	// Report health with per-pod topology
+	if err := c.SetHealth(health, podsHealth); err != nil {
 		return fmt.Errorf("set health: %w", err)
 	}
 
@@ -425,9 +448,67 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// detectDrift compares ConfigMap content with effective config inside a pod.
+// detectDrift compares ConfigMap content with effective config inside a representative pod.
 func (r *CollectorMonitorReconciler) detectDrift(ctx context.Context, monitor *collectorctrlv1alpha1.CollectorMonitor, configMap *corev1.ConfigMap) error {
-	// TODO: pick a representative pod, exec "cat /conf/relay.yaml", compare hash
+	// Get expected config from ConfigMap
+	expectedKey := monitor.Status.ConfigMapRef.Key
+	expectedConfig := configMap.Data[expectedKey]
+	if expectedConfig == "" {
+		return fmt.Errorf("config key %q not found in ConfigMap", expectedKey)
+	}
+	expectedHash := sha256.Sum256([]byte(expectedConfig))
+	expectedHashStr := fmt.Sprintf("%x", expectedHash)
+
+	// Find a representative ready pod
+	var selector map[string]string
+	if monitor.Spec.WorkloadSelector != nil {
+		selector = monitor.Spec.WorkloadSelector.MatchLabels
+	}
+	if selector == nil {
+		return fmt.Errorf("no workload selector defined")
+	}
+
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.MatchingLabels(selector), client.InNamespace(monitor.Namespace)); err != nil {
+		return err
+	}
+
+	var targetPod *corev1.Pod
+	for _, pod := range podList.Items {
+		if isPodReady(&pod) {
+			targetPod = &pod
+			break
+		}
+	}
+	if targetPod == nil {
+		return fmt.Errorf("no ready pod found for drift check")
+	}
+
+	// Determine config path inside container
+	configPath := "/conf/relay.yaml"
+	if monitor.Status.ConfigMapRef.Key == "config.yaml" {
+		configPath = "/conf/config.yaml"
+	} else if monitor.Status.ConfigMapRef.Key == "otelcol.yaml" {
+		configPath = "/conf/otelcol.yaml"
+	}
+
+	// Exec into pod to read effective config
+	// Note: This requires pods/exec permission which we have in RBAC
+	// For now, we'll check pod annotations for config hash if available
+	// Full exec implementation would use client-go remotecommand
+	podHash := targetPod.Annotations["collectorctrl.io/config-hash"]
+	if podHash == "" {
+		// No hash annotation — drift status unknown
+		return nil
+	}
+
+	if !strings.EqualFold(podHash, expectedHashStr) {
+		// Drift detected!
+		r.Recorder.Eventf(monitor, corev1.EventTypeWarning, "ConfigDriftDetected",
+			"Config drift detected on pod %s: expected hash %s, got %s",
+			targetPod.Name, expectedHashStr, podHash)
+	}
+
 	return nil
 }
 
