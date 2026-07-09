@@ -344,7 +344,7 @@ func (r *CollectorMonitorReconciler) applyEmergencyConfig(ctx context.Context, m
 	return nil
 }
 
-// reportFleetHealth sends the current pod list and aggregate health to the server.
+// reportFleetHealth sends the current pod list, aggregate health, and config to the server.
 func (r *CollectorMonitorReconciler) reportFleetHealth(ctx context.Context, monitor *collectorctrlv1alpha1.CollectorMonitor, workload client.Object) error {
 	key := fmt.Sprintf("%s/%s", monitor.Namespace, monitor.Name)
 	r.opampMu.Lock()
@@ -353,10 +353,76 @@ func (r *CollectorMonitorReconciler) reportFleetHealth(ctx context.Context, moni
 	if c == nil {
 		return nil // no connection yet
 	}
-	// TODO: list pods belonging to the workload, aggregate readiness, scrape metrics
-	// Build AgentToServer message and send via the per-CR client
-	_ = c
+
+	// Extract pod selector from workload
+	var selector map[string]string
+	switch w := workload.(type) {
+	case *appsv1.DaemonSet:
+		selector = w.Spec.Selector.MatchLabels
+	case *appsv1.Deployment:
+		selector = w.Spec.Selector.MatchLabels
+	case *appsv1.StatefulSet:
+		selector = w.Spec.Selector.MatchLabels
+	}
+
+	// List pods belonging to this workload
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.MatchingLabels(selector), client.InNamespace(monitor.Namespace)); err != nil {
+		return err
+	}
+
+	total := len(podList.Items)
+	ready := 0
+	for _, pod := range podList.Items {
+		if isPodReady(&pod) {
+			ready++
+		}
+	}
+
+	// Determine health status
+	var health api.HealthStatus
+	switch {
+	case total == 0:
+		health = api.HealthUnknown
+	case ready == total:
+		health = api.HealthHealthy
+	case ready > 0:
+		health = api.HealthDegraded
+	default:
+		health = api.HealthUnhealthy
+	}
+
+	// Report health to OpAMP server
+	if err := c.SetHealth(health, total, ready); err != nil {
+		return fmt.Errorf("set health: %w", err)
+	}
+
+	// Report effective config (ConfigMap content) to OpAMP server
+	if monitor.Status.ConfigMapRef != nil {
+		var cm corev1.ConfigMap
+		if err := r.Get(ctx, client.ObjectKey{
+			Namespace: monitor.Status.ConfigMapRef.Namespace,
+			Name:      monitor.Status.ConfigMapRef.Name,
+		}, &cm); err == nil {
+			if configYAML, ok := cm.Data[monitor.Status.ConfigMapRef.Key]; ok {
+				if err := c.SetEffectiveConfig(configYAML); err != nil {
+					return fmt.Errorf("set effective config: %w", err)
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+// isPodReady returns true if the pod has a Ready condition set to True.
+func isPodReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // detectDrift compares ConfigMap content with effective config inside a pod.

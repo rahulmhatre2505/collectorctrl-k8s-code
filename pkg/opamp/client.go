@@ -1,111 +1,66 @@
 // pkg/opamp/client.go
-// Shared OpAMP client library for both CollectorCtrl Server and K8s Operator.
-// This is a NEW package. If the server has existing OpAMP code, migrate it here
-// or wrap it. The key requirement: both sides import the same message types.
+// OpAMP client wrapper using the official opamp-go library with protobuf.
+// This replaces the previous JSON-over-WebSocket implementation.
 
 package opamp
 
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
-	"time"
 
-	"github.com/gorilla/websocket"
+	opampclient "github.com/open-telemetry/opamp-go/client"
+	opampcltypes "github.com/open-telemetry/opamp-go/client/types"
+	"github.com/open-telemetry/opamp-go/protobufs"
 
 	"github.com/collectorctrl/collectorctrl/pkg/api"
 )
 
-// MessageType identifies the kind of OpAMP message.
-type MessageType string
-
-const (
-	MsgAgentToServer      MessageType = "AgentToServer"
-	MsgServerToAgent      MessageType = "ServerToAgent"
-	MsgEmergencyConfig    MessageType = "EmergencyConfig"
-	MsgEmergencyAck       MessageType = "EmergencyAck"
-	MsgHealthReport       MessageType = "HealthReport"
-	MsgDriftAlert         MessageType = "DriftAlert"
-)
-
-// ClientConfig configures the OpAMP client.
+// ClientConfig configures the fleet-level OpAMP client.
 type ClientConfig struct {
-	Endpoint    string
-	Headers     map[string]string // e.g., Authorization: Secret-Key xxx
-	TLSConfig   *tls.Config
-	AgentID     string
-	AgentType   api.AgentType
-	Labels      map[string]string
-	K8sContext  *api.K8sContext // nil for VM agents
+	Endpoint   string
+	Headers    map[string]string // e.g., Authorization: Secret-Key xxx
+	TLSConfig  *tls.Config
+	AgentID    string
+	AgentType  api.AgentType
+	Labels     map[string]string
+	K8sContext *api.K8sContext // nil for VM agents
 }
 
-// Client is an OpAMP client that maintains a persistent WebSocket connection.
+// Client wraps the official opamp-go client for fleet-level reporting.
 type Client struct {
 	config ClientConfig
 
-	conn      *websocket.Conn
+	client    opampclient.OpAMPClient
+	connected bool
 	connMu    sync.RWMutex
-	stopCh    chan struct{}
-	doneCh    chan struct{}
 
-	// Handlers registered by the consumer (server or operator).
-	onConfigUpdate  func(ConfigUpdate)
-	onEmergencyCmd  func(EmergencyCommand)
-	onServerStatus  func(ServerStatus)
+	effectiveConfig string
+	configMu        sync.RWMutex
 
-	lastHealth api.HealthStatus
-	healthMu   sync.RWMutex
+	onConfigUpdate func(ConfigUpdate)
+	onEmergencyCmd func(EmergencyCommand)
 }
 
 // ConfigUpdate is sent by the server to push a new configuration.
 type ConfigUpdate struct {
-	ConfigYAML       string            `json:"configYaml"`
-	ConfigHash       string            `json:"configHash"`
-	RolloutStrategy  *api.RolloutStrategy `json:"rolloutStrategy,omitempty"`
+	ConfigYAML      string               `json:"configYaml"`
+	ConfigHash      string               `json:"configHash"`
+	RolloutStrategy *api.RolloutStrategy `json:"rolloutStrategy,omitempty"`
 }
 
 // EmergencyCommand is sent by the server to force an immediate config change.
 type EmergencyCommand struct {
 	ConfigYAML string `json:"configYaml"`
-	Reason     string `json:"reason"` // human-readable reason for emergency
+	Reason     string `json:"reason"`
 }
 
-// ServerStatus carries server-side metadata (e.g., server version, capabilities).
-type ServerStatus struct {
-	ServerVersion string `json:"serverVersion"`
-}
-
-// AgentToServer is the message sent periodically by the client.
-type AgentToServer struct {
-	Type          MessageType           `json:"type"`
-	AgentID       string                `json:"agentId"`
-	AgentType     api.AgentType         `json:"agentType"`
-	Labels        map[string]string     `json:"labels"`
-	K8sContext    *api.K8sContext       `json:"k8sContext,omitempty"`
-	Version       string                `json:"version,omitempty"`
-	EffectiveConfigHash string          `json:"effectiveConfigHash,omitempty"`
-	Health        api.HealthStatus      `json:"health"`
-	Metrics       map[string]float64    `json:"metrics,omitempty"`
-	Timestamp     time.Time             `json:"timestamp"`
-}
-
-// ServerToAgent is the message sent by the server.
-type ServerToAgent struct {
-	Type         MessageType      `json:"type"`
-	ConfigUpdate *ConfigUpdate    `json:"configUpdate,omitempty"`
-	Emergency    *EmergencyCommand `json:"emergency,omitempty"`
-	Status       *ServerStatus    `json:"status,omitempty"`
-}
-
-// NewClient creates an OpAMP client.
+// NewClient creates a fleet-level OpAMP client.
 func NewClient(cfg ClientConfig) *Client {
 	return &Client{
 		config: cfg,
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
 	}
 }
 
@@ -119,177 +74,209 @@ func (c *Client) OnEmergencyCmd(fn func(EmergencyCommand)) {
 	c.onEmergencyCmd = fn
 }
 
-// OnServerStatus registers a handler for server status messages.
-func (c *Client) OnServerStatus(fn func(ServerStatus)) {
-	c.onServerStatus = fn
-}
-
-// Start establishes the WebSocket connection and begins the heartbeat loop.
+// Start establishes the OpAMP connection.
 func (c *Client) Start(ctx context.Context) error {
-	dialer := websocket.Dialer{
-		TLSClientConfig: c.config.TLSConfig,
-		HandshakeTimeout: 10 * time.Second,
-	}
+	c.client = opampclient.NewWebSocket(nil)
 
-	headers := http.Header{}
+	// Build HTTP headers
+	headers := make(http.Header)
 	for k, v := range c.config.Headers {
 		headers.Set(k, v)
 	}
 
-	conn, _, err := dialer.DialContext(ctx, c.config.Endpoint, headers)
-	if err != nil {
-		return fmt.Errorf("opamp dial %s: %w", c.config.Endpoint, err)
+	// Build capabilities
+	capabilities := protobufs.AgentCapabilities_AgentCapabilities_ReportsHealth |
+		protobufs.AgentCapabilities_AgentCapabilities_ReportsEffectiveConfig |
+		protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus |
+		protobufs.AgentCapabilities_AgentCapabilities_AcceptsRestartCommand
+
+	settings := opampcltypes.StartSettings{
+		OpAMPServerURL: c.config.Endpoint,
+		TLSConfig:      c.config.TLSConfig,
+		InstanceUid:    opampcltypes.InstanceUid(c.instanceUID()),
+		Header:         headers,
+		Callbacks: opampcltypes.Callbacks{
+			OnConnect: func(ctx context.Context) {
+				c.connMu.Lock()
+				c.connected = true
+				c.connMu.Unlock()
+			},
+			OnConnectFailed: func(ctx context.Context, err error) {
+				_ = err
+			},
+			OnError: func(ctx context.Context, err *protobufs.ServerErrorResponse) {
+				_ = err
+			},
+			GetEffectiveConfig: func(ctx context.Context) (*protobufs.EffectiveConfig, error) {
+				return c.getEffectiveConfig(), nil
+			},
+			OnMessage: c.onMessage,
+		},
+		Capabilities: capabilities,
 	}
 
-	c.connMu.Lock()
-	c.conn = conn
-	c.connMu.Unlock()
+	// Set agent description with K8s context
+	if err := c.client.SetAgentDescription(c.agentDescription()); err != nil {
+		return fmt.Errorf("set agent description: %w", err)
+	}
 
-	go c.readLoop()
-	go c.heartbeatLoop()
+	if err := c.client.Start(ctx, settings); err != nil {
+		return fmt.Errorf("opamp start: %w", err)
+	}
 
 	return nil
 }
 
-// Stop closes the connection and waits for goroutines to exit.
+// Stop closes the OpAMP connection.
 func (c *Client) Stop() {
-	close(c.stopCh)
-	c.connMu.Lock()
-	if c.conn != nil {
-		c.conn.Close()
+	if c.client != nil {
+		_ = c.client.Stop(context.Background())
 	}
-	c.connMu.Unlock()
-	<-c.doneCh
 }
 
-// SendAgentReport sends the periodic status update to the server.
-func (c *Client) SendAgentReport(report AgentToServer) error {
-	c.healthMu.RLock()
-	c.lastHealth = report.Health
-	c.healthMu.RUnlock()
+// SetHealth updates the health status reported to the server.
+func (c *Client) SetHealth(health api.HealthStatus, totalPods, readyPods int) error {
+	if c.client == nil {
+		return fmt.Errorf("client not started")
+	}
 
-	return c.send(report)
-}
-
-// SendDriftAlert reports a config drift event.
-func (c *Client) SendDriftAlert(podName, expectedHash, actualHash string) error {
-	msg := AgentToServer{
-		Type:      MsgDriftAlert,
-		AgentID:   c.config.AgentID,
-		AgentType: c.config.AgentType,
-		Labels: map[string]string{
-			"drift.pod":     podName,
-			"drift.expected": expectedHash,
-			"drift.actual":   actualHash,
+	healthy := health == api.HealthHealthy
+	componentHealthMap := map[string]*protobufs.ComponentHealth{
+		"fleet": {
+			Healthy:            healthy,
+			StartTimeUnixNano:  0,
+			StatusTimeUnixNano: 0,
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"total_pods": {
+					Healthy: true,
+					Status:  fmt.Sprintf("%d", totalPods),
+				},
+				"ready_pods": {
+					Healthy: readyPods == totalPods,
+					Status:  fmt.Sprintf("%d", readyPods),
+				},
+			},
 		},
-		Timestamp: time.Now().UTC(),
 	}
-	return c.send(msg)
+
+	return c.client.SetHealth(&protobufs.ComponentHealth{
+		Healthy:            healthy,
+		ComponentHealthMap: componentHealthMap,
+	})
 }
 
-// SendEmergencyAck acknowledges an emergency command.
+// SetEffectiveConfig stores the config and triggers sending it to the server.
+func (c *Client) SetEffectiveConfig(configYAML string) error {
+	if c.client == nil {
+		return fmt.Errorf("client not started")
+	}
+
+	c.configMu.Lock()
+	c.effectiveConfig = configYAML
+	c.configMu.Unlock()
+
+	return c.client.UpdateEffectiveConfig(context.Background())
+}
+
+// SendEmergencyAck sends an emergency acknowledgement to the server.
 func (c *Client) SendEmergencyAck(success bool, errMsg string) error {
-	msg := AgentToServer{
-		Type:    MsgEmergencyAck,
-		AgentID: c.config.AgentID,
-		Labels: map[string]string{
-			"emergency.success": fmt.Sprintf("%v", success),
-			"emergency.error":   errMsg,
-		},
-		Timestamp: time.Now().UTC(),
+	if c.client == nil {
+		return fmt.Errorf("client not started")
 	}
-	return c.send(msg)
+
+	data := fmt.Sprintf("emergency_ack:%v:%s", success, errMsg)
+	_, err := c.client.SendCustomMessage(&protobufs.CustomMessage{
+		Capability: "collectorctrl",
+		Type:       "emergency_ack",
+		Data:       []byte(data),
+	})
+	return err
 }
 
-// send writes a JSON message to the WebSocket.
-func (c *Client) send(v interface{}) error {
+// Connected returns true if the client is connected.
+func (c *Client) Connected() bool {
 	c.connMu.RLock()
-	conn := c.conn
-	c.connMu.RUnlock()
-
-	if conn == nil {
-		return fmt.Errorf("opamp: not connected")
-	}
-
-	data, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	return conn.WriteMessage(websocket.TextMessage, data)
+	defer c.connMu.RUnlock()
+	return c.connected
 }
 
-// readLoop handles incoming server messages.
-func (c *Client) readLoop() {
-	defer close(c.doneCh)
+// instanceUID generates a stable instance UID from the agent ID.
+func (c *Client) instanceUID() [16]byte {
+	var uid [16]byte
+	copy(uid[:], []byte(c.config.AgentID))
+	return uid
+}
 
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		default:
-		}
+// agentDescription builds the protobuf AgentDescription.
+func (c *Client) agentDescription() *protobufs.AgentDescription {
+	identifying := []*protobufs.KeyValue{
+		keyVal("service.name", string(c.config.AgentType)),
+		keyVal("service.instance.id", c.config.AgentID),
+	}
 
-		c.connMu.RLock()
-		conn := c.conn
-		c.connMu.RUnlock()
+	nonIdentifying := []*protobufs.KeyValue{}
+	for k, v := range c.config.Labels {
+		nonIdentifying = append(nonIdentifying, keyVal(k, v))
+	}
 
-		if conn == nil {
-			time.Sleep(time.Second)
-			continue
-		}
+	// Add K8s context as attributes
+	if kc := c.config.K8sContext; kc != nil {
+		nonIdentifying = append(nonIdentifying,
+			keyVal("k8s.cluster.name", kc.ClusterName),
+			keyVal("k8s.namespace", kc.Namespace),
+			keyVal("k8s.workload.type", kc.WorkloadType),
+			keyVal("k8s.workload.name", kc.WorkloadName),
+			keyVal("k8s.configmap.name", kc.ConfigMapName),
+			keyVal("k8s.configmap.key", kc.ConfigMapKey),
+		)
+	}
 
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			// TODO: implement exponential backoff reconnect
-			continue
-		}
-
-		var msg ServerToAgent
-		if err := json.Unmarshal(data, &msg); err != nil {
-			continue
-		}
-
-		switch msg.Type {
-		case MsgServerToAgent:
-			if msg.ConfigUpdate != nil && c.onConfigUpdate != nil {
-				c.onConfigUpdate(*msg.ConfigUpdate)
-			}
-			if msg.Status != nil && c.onServerStatus != nil {
-				c.onServerStatus(*msg.Status)
-			}
-		case MsgEmergencyConfig:
-			if msg.Emergency != nil && c.onEmergencyCmd != nil {
-				c.onEmergencyCmd(*msg.Emergency)
-			}
-		}
+	return &protobufs.AgentDescription{
+		IdentifyingAttributes:    identifying,
+		NonIdentifyingAttributes: nonIdentifying,
 	}
 }
 
-// heartbeatLoop sends periodic keep-alive reports.
-func (c *Client) heartbeatLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// getEffectiveConfig returns the current effective config protobuf.
+func (c *Client) getEffectiveConfig() *protobufs.EffectiveConfig {
+	c.configMu.RLock()
+	cfg := c.effectiveConfig
+	c.configMu.RUnlock()
 
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			c.healthMu.RLock()
-			health := c.lastHealth
-			c.healthMu.RUnlock()
+	return &protobufs.EffectiveConfig{
+		ConfigMap: &protobufs.AgentConfigMap{
+			ConfigMap: map[string]*protobufs.AgentConfigFile{
+				"": {
+					Body:        []byte(cfg),
+					ContentType: "text/yaml",
+				},
+			},
+		},
+	}
+}
 
-			report := AgentToServer{
-				Type:      MsgAgentToServer,
-				AgentID:   c.config.AgentID,
-				AgentType: c.config.AgentType,
-				Labels:    c.config.Labels,
-				K8sContext: c.config.K8sContext,
-				Health:    health,
-				Timestamp: time.Now().UTC(),
+// onMessage handles incoming server messages.
+func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
+	if msg.RemoteConfig != nil && c.onConfigUpdate != nil {
+		cfg := msg.RemoteConfig.Config
+		if cfg != nil {
+			for _, file := range cfg.GetConfigMap() {
+				c.onConfigUpdate(ConfigUpdate{
+					ConfigYAML: string(file.Body),
+					ConfigHash: fmt.Sprintf("%x", msg.RemoteConfig.ConfigHash),
+				})
+				break
 			}
-			_ = c.send(report)
 		}
+	}
+}
+
+// keyVal is a helper to build protobuf KeyValue.
+func keyVal(key, value string) *protobufs.KeyValue {
+	return &protobufs.KeyValue{
+		Key: key,
+		Value: &protobufs.AnyValue{
+			Value: &protobufs.AnyValue_StringValue{StringValue: value},
+		},
 	}
 }
