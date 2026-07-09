@@ -35,7 +35,7 @@ spec:
             readOnlyRootFilesystem: true
             runAsUser: 65532
             runAsGroup: 65532
-          image: "ghcr.io/rahulmhatre2505/collectorctrl-operator:v1.0.0"
+          image: "ghcr.io/rahulmhatre2505/collectorctrl-k8s-code/operator:latest"
           imagePullPolicy: Always
           args:
             - --metrics-bind-address=:8080

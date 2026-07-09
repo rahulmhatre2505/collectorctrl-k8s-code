@@ -39,7 +39,6 @@ spec:
     matchLabels:
       app.kubernetes.io/instance: otel-coralogix-integration
       app.kubernetes.io/name: opentelemetry-agent
-      component: agent-collector
     kind: DaemonSet
 
   configMapSelector:
@@ -85,7 +84,6 @@ spec:
     matchLabels:
       app.kubernetes.io/instance: otel-coralogix-integration
       app.kubernetes.io/name: opentelemetry-cluster-collector
-      component: standalone-collector
     kind: Deployment
 
   configMapSelector:

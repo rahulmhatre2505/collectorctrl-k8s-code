@@ -7,6 +7,7 @@ package controllers
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
 	"sync"
 	"time"
@@ -255,6 +256,11 @@ func (r *CollectorMonitorReconciler) ensureOpAMPConnection(ctx context.Context, 
 		cfg.Headers = map[string]string{
 			"Authorization": fmt.Sprintf("Secret-Key %s", string(secret.Data[keyName])),
 		}
+	}
+
+	// TODO: For testing with self-signed certs only. Remove in production — use proper CA cert.
+	cfg.TLSConfig = &tls.Config{
+		InsecureSkipVerify: true,
 	}
 
 	client := opamp.NewClient(cfg)
