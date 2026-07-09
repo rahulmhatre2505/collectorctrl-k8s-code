@@ -38,10 +38,6 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Secrets (for auth credentials from CollectorMonitor namespace)
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
   # CRD management
   - apiGroups: ["collectorctrl.io"]
     resources: ["collectormonitors"]
