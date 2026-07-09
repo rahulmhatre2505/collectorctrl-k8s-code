@@ -460,12 +460,9 @@ func (r *CollectorMonitorReconciler) detectDrift(ctx context.Context, monitor *c
 	expectedHashStr := fmt.Sprintf("%x", expectedHash)
 
 	// Find a representative ready pod
-	var selector map[string]string
-	if monitor.Spec.WorkloadSelector != nil {
-		selector = monitor.Spec.WorkloadSelector.MatchLabels
-	}
-	if selector == nil {
-		return fmt.Errorf("no workload selector defined")
+	selector := monitor.Spec.WorkloadSelector.MatchLabels
+	if len(selector) == 0 {
+		return fmt.Errorf("no workload selector matchLabels defined")
 	}
 
 	var podList corev1.PodList
@@ -484,18 +481,7 @@ func (r *CollectorMonitorReconciler) detectDrift(ctx context.Context, monitor *c
 		return fmt.Errorf("no ready pod found for drift check")
 	}
 
-	// Determine config path inside container
-	configPath := "/conf/relay.yaml"
-	if monitor.Status.ConfigMapRef.Key == "config.yaml" {
-		configPath = "/conf/config.yaml"
-	} else if monitor.Status.ConfigMapRef.Key == "otelcol.yaml" {
-		configPath = "/conf/otelcol.yaml"
-	}
-
-	// Exec into pod to read effective config
-	// Note: This requires pods/exec permission which we have in RBAC
-	// For now, we'll check pod annotations for config hash if available
-	// Full exec implementation would use client-go remotecommand
+	// Check pod annotation for config hash (full exec implementation would read mounted config file)
 	podHash := targetPod.Annotations["collectorctrl.io/config-hash"]
 	if podHash == "" {
 		// No hash annotation — drift status unknown
