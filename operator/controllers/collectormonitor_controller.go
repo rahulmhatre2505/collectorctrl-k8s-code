@@ -7,6 +7,7 @@ package controllers
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
 	"sync"
 	"time"
@@ -32,11 +33,11 @@ type CollectorMonitorReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 
-	// OpAMPClient is the cluster-level OpAMP connection to the CollectorCtrl Server.
-	opampClient *opamp.Client
+	// opampClients holds one OpAMP client per CollectorMonitor CR.
+	opampClients map[string]*opamp.Client
 
 	// opampRunning prevents multiple connections for the same CR.
-	opampMu     sync.Mutex
+	opampMu      sync.Mutex
 	opampStarted map[string]bool
 }
 
@@ -57,6 +58,8 @@ func (r *CollectorMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	monitor := &collectorctrlv1alpha1.CollectorMonitor{}
 	if err := r.Get(ctx, req.NamespacedName, monitor); err != nil {
 		if errors.IsNotFound(err) {
+			// CollectorMonitor deleted — close its OpAMP client if any.
+			r.cleanupOpAMPClient(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -220,18 +223,18 @@ func (r *CollectorMonitorReconciler) ensureOpAMPConnection(ctx context.Context, 
 		AgentID:   fmt.Sprintf("k8s://%s/%s/%s/%s", clusterName, monitor.Namespace, kind, workload.GetName()),
 		AgentType: api.AgentTypeKubernetes,
 		Labels: map[string]string{
-			"k8s.cluster.name": clusterName,
-			"k8s.namespace":    monitor.Namespace,
+			"k8s.cluster.name":  clusterName,
+			"k8s.namespace":     monitor.Namespace,
 			"k8s.workload.type": kind,
 			"k8s.workload.name": workload.GetName(),
 		},
 		K8sContext: &api.K8sContext{
-			ClusterName:    clusterName,
-			Namespace:      monitor.Namespace,
-			WorkloadType:   kind,
-			WorkloadName:   workload.GetName(),
-			ConfigMapName:  monitor.Status.ConfigMapRef.Name,
-			ConfigMapKey:   monitor.Status.ConfigMapRef.Key,
+			ClusterName:   clusterName,
+			Namespace:     monitor.Namespace,
+			WorkloadType:  kind,
+			WorkloadName:  workload.GetName(),
+			ConfigMapName: monitor.Status.ConfigMapRef.Name,
+			ConfigMapKey:  monitor.Status.ConfigMapRef.Key,
 		},
 	}
 
@@ -255,6 +258,11 @@ func (r *CollectorMonitorReconciler) ensureOpAMPConnection(ctx context.Context, 
 		cfg.Headers = map[string]string{
 			"Authorization": fmt.Sprintf("Secret-Key %s", string(secret.Data[keyName])),
 		}
+	}
+
+	// TODO: For testing with self-signed certs only. Remove in production — use proper CA cert.
+	cfg.TLSConfig = &tls.Config{
+		InsecureSkipVerify: true,
 	}
 
 	client := opamp.NewClient(cfg)
@@ -285,7 +293,7 @@ func (r *CollectorMonitorReconciler) ensureOpAMPConnection(ctx context.Context, 
 		return err
 	}
 
-	r.opampClient = client
+	r.opampClients[key] = client
 	r.opampStarted[key] = true
 	return nil
 }
@@ -338,8 +346,16 @@ func (r *CollectorMonitorReconciler) applyEmergencyConfig(ctx context.Context, m
 
 // reportFleetHealth sends the current pod list and aggregate health to the server.
 func (r *CollectorMonitorReconciler) reportFleetHealth(ctx context.Context, monitor *collectorctrlv1alpha1.CollectorMonitor, workload client.Object) error {
+	key := fmt.Sprintf("%s/%s", monitor.Namespace, monitor.Name)
+	r.opampMu.Lock()
+	c := r.opampClients[key]
+	r.opampMu.Unlock()
+	if c == nil {
+		return nil // no connection yet
+	}
 	// TODO: list pods belonging to the workload, aggregate readiness, scrape metrics
-	// Build AgentToServer message and send via opampClient
+	// Build AgentToServer message and send via the per-CR client
+	_ = c
 	return nil
 }
 
@@ -377,8 +393,26 @@ func (r *CollectorMonitorReconciler) setCondition(ctx context.Context, monitor *
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CollectorMonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.opampStarted == nil {
+		r.opampStarted = make(map[string]bool)
+	}
+	if r.opampClients == nil {
+		r.opampClients = make(map[string]*opamp.Client)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&collectorctrlv1alpha1.CollectorMonitor{}).
 		Owns(&corev1.ConfigMap{}).
 		Complete(r)
+}
+
+// cleanupOpAMPClient closes the OpAMP connection for a deleted CollectorMonitor.
+func (r *CollectorMonitorReconciler) cleanupOpAMPClient(ns, name string) {
+	key := fmt.Sprintf("%s/%s", ns, name)
+	r.opampMu.Lock()
+	defer r.opampMu.Unlock()
+	if c := r.opampClients[key]; c != nil {
+		c.Stop()
+		delete(r.opampClients, key)
+	}
+	delete(r.opampStarted, key)
 }
