@@ -1,6 +1,5 @@
 // pkg/opamp/client.go
 // OpAMP client wrapper using the official opamp-go library with protobuf.
-// This replaces the previous JSON-over-WebSocket implementation.
 
 package opamp
 
@@ -22,15 +21,15 @@ import (
 // ClientConfig configures the fleet-level OpAMP client.
 type ClientConfig struct {
 	Endpoint   string
-	Headers    map[string]string // e.g., Authorization: Secret-Key xxx
+	Headers    map[string]string
 	TLSConfig  *tls.Config
 	AgentID    string
 	AgentType  api.AgentType
 	Labels     map[string]string
-	K8sContext *api.K8sContext // nil for VM agents
+	K8sContext *api.K8sContext
 }
 
-// Client wraps the official opamp-go client for fleet-level reporting.
+// Client wraps the official opamp-go client.
 type Client struct {
 	config ClientConfig
 
@@ -47,22 +46,20 @@ type Client struct {
 
 // ConfigUpdate is sent by the server to push a new configuration.
 type ConfigUpdate struct {
-	ConfigYAML      string               `json:"configYaml"`
-	ConfigHash      string               `json:"configHash"`
-	RolloutStrategy *api.RolloutStrategy `json:"rolloutStrategy,omitempty"`
+	ConfigYAML      string
+	ConfigHash      string
+	RolloutStrategy *api.RolloutStrategy
 }
 
 // EmergencyCommand is sent by the server to force an immediate config change.
 type EmergencyCommand struct {
-	ConfigYAML string `json:"configYaml"`
-	Reason     string `json:"reason"`
+	ConfigYAML string
+	Reason     string
 }
 
 // NewClient creates a fleet-level OpAMP client.
 func NewClient(cfg ClientConfig) *Client {
-	return &Client{
-		config: cfg,
-	}
+	return &Client{config: cfg}
 }
 
 // OnConfigUpdate registers a handler for normal config pushes.
@@ -79,13 +76,11 @@ func (c *Client) OnEmergencyCmd(fn func(EmergencyCommand)) {
 func (c *Client) Start(ctx context.Context) error {
 	c.client = opampclient.NewWebSocket(nil)
 
-	// Build HTTP headers
 	headers := make(http.Header)
 	for k, v := range c.config.Headers {
 		headers.Set(k, v)
 	}
 
-	// Build capabilities
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_ReportsHealth |
 		protobufs.AgentCapabilities_AgentCapabilities_ReportsEffectiveConfig |
 		protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus |
@@ -102,12 +97,8 @@ func (c *Client) Start(ctx context.Context) error {
 				c.connected = true
 				c.connMu.Unlock()
 			},
-			OnConnectFailed: func(ctx context.Context, err error) {
-				_ = err
-			},
-			OnError: func(ctx context.Context, err *protobufs.ServerErrorResponse) {
-				_ = err
-			},
+			OnConnectFailed: func(ctx context.Context, err error) { _ = err },
+			OnError:         func(ctx context.Context, err *protobufs.ServerErrorResponse) { _ = err },
 			GetEffectiveConfig: func(ctx context.Context) (*protobufs.EffectiveConfig, error) {
 				return c.getEffectiveConfig(), nil
 			},
@@ -116,9 +107,19 @@ func (c *Client) Start(ctx context.Context) error {
 		Capabilities: capabilities,
 	}
 
-	// Set agent description with K8s context
+	// Set agent description
 	if err := c.client.SetAgentDescription(c.agentDescription()); err != nil {
 		return fmt.Errorf("set agent description: %w", err)
+	}
+
+	// Set initial health BEFORE Start() — opamp-go requires this
+	if err := c.client.SetHealth(&protobufs.ComponentHealth{
+		Healthy: false,
+		ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+			"fleet": {Healthy: false, Status: "initializing"},
+		},
+	}); err != nil {
+		return fmt.Errorf("set initial health: %w", err)
 	}
 
 	if err := c.client.Start(ctx, settings); err != nil {
@@ -159,26 +160,16 @@ func (c *Client) SetHealth(health api.HealthStatus, pods []PodHealth) error {
 	total := len(pods)
 	healthy := health == api.HealthHealthy
 
-	// Build component health map: one entry per pod + fleet summary
 	componentHealthMap := map[string]*protobufs.ComponentHealth{
 		"fleet": {
-			Healthy:            healthy,
-			StartTimeUnixNano:  0,
-			StatusTimeUnixNano: 0,
+			Healthy: healthy,
 			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
-				"total_pods": {
-					Healthy: true,
-					Status:  fmt.Sprintf("%d", total),
-				},
-				"ready_pods": {
-					Healthy: ready == total,
-					Status:  fmt.Sprintf("%d", ready),
-				},
+				"total_pods": {Healthy: true, Status: fmt.Sprintf("%d", total)},
+				"ready_pods": {Healthy: ready == total, Status: fmt.Sprintf("%d", ready)},
 			},
 		},
 	}
 
-	// Add each pod as a component for topology visibility
 	for _, p := range pods {
 		status := fmt.Sprintf("node=%s ip=%s phase=%s", p.Node, p.IP, p.Phase)
 		componentHealthMap["pod/"+p.Name] = &protobufs.ComponentHealth{
@@ -198,11 +189,9 @@ func (c *Client) SetEffectiveConfig(configYAML string) error {
 	if c.client == nil {
 		return fmt.Errorf("client not started")
 	}
-
 	c.configMu.Lock()
 	c.effectiveConfig = configYAML
 	c.configMu.Unlock()
-
 	return c.client.UpdateEffectiveConfig(context.Background())
 }
 
@@ -211,7 +200,6 @@ func (c *Client) SendEmergencyAck(success bool, errMsg string) error {
 	if c.client == nil {
 		return fmt.Errorf("client not started")
 	}
-
 	data := fmt.Sprintf("emergency_ack:%v:%s", success, errMsg)
 	_, err := c.client.SendCustomMessage(&protobufs.CustomMessage{
 		Capability: "collectorctrl",
@@ -228,14 +216,12 @@ func (c *Client) Connected() bool {
 	return c.connected
 }
 
-// instanceUID generates a stable instance UID from the agent ID.
 func (c *Client) instanceUID() [16]byte {
 	var uid [16]byte
 	copy(uid[:], []byte(c.config.AgentID))
 	return uid
 }
 
-// agentDescription builds the protobuf AgentDescription.
 func (c *Client) agentDescription() *protobufs.AgentDescription {
 	identifying := []*protobufs.KeyValue{
 		keyVal("service.name", string(c.config.AgentType)),
@@ -247,7 +233,6 @@ func (c *Client) agentDescription() *protobufs.AgentDescription {
 		nonIdentifying = append(nonIdentifying, keyVal(k, v))
 	}
 
-	// Add K8s context as attributes
 	if kc := c.config.K8sContext; kc != nil {
 		nonIdentifying = append(nonIdentifying,
 			keyVal("k8s.cluster.name", kc.ClusterName),
@@ -265,7 +250,6 @@ func (c *Client) agentDescription() *protobufs.AgentDescription {
 	}
 }
 
-// getEffectiveConfig returns the current effective config protobuf.
 func (c *Client) getEffectiveConfig() *protobufs.EffectiveConfig {
 	c.configMu.RLock()
 	cfg := c.effectiveConfig
@@ -274,18 +258,13 @@ func (c *Client) getEffectiveConfig() *protobufs.EffectiveConfig {
 	return &protobufs.EffectiveConfig{
 		ConfigMap: &protobufs.AgentConfigMap{
 			ConfigMap: map[string]*protobufs.AgentConfigFile{
-				"": {
-					Body:        []byte(cfg),
-					ContentType: "text/yaml",
-				},
+				"": {Body: []byte(cfg), ContentType: "text/yaml"},
 			},
 		},
 	}
 }
 
-// onMessage handles incoming server messages.
 func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
-	// Handle normal config updates
 	if msg.RemoteConfig != nil && c.onConfigUpdate != nil {
 		cfg := msg.RemoteConfig.Config
 		if cfg != nil {
@@ -299,19 +278,15 @@ func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
 		}
 	}
 
-	// Handle emergency override commands via custom messages
 	if msg.CustomMessage != nil && c.onEmergencyCmd != nil {
 		cm := msg.CustomMessage
 		if strings.EqualFold(cm.Type, "emergency") && strings.EqualFold(cm.Capability, "collectorctrl") {
-			// Parse emergency command from custom message data
-			// Format: "emergency:<reason>\n---\n<configYAML>"
 			data := string(cm.Data)
 			parts := strings.SplitN(data, "\n---\n", 2)
 			reason := "emergency override"
 			configYAML := data
 			if len(parts) == 2 {
-				reason = strings.TrimPrefix(parts[0], "emergency:")
-				reason = strings.TrimSpace(reason)
+				reason = strings.TrimSpace(strings.TrimPrefix(parts[0], "emergency:"))
 				configYAML = parts[1]
 			}
 			c.onEmergencyCmd(EmergencyCommand{
@@ -322,7 +297,6 @@ func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
 	}
 }
 
-// keyVal is a helper to build protobuf KeyValue.
 func keyVal(key, value string) *protobufs.KeyValue {
 	return &protobufs.KeyValue{
 		Key: key,
