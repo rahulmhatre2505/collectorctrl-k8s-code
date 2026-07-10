@@ -5,6 +5,7 @@ package opamp
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"fmt"
 	"net/http"
@@ -216,9 +217,11 @@ func (c *Client) Connected() bool {
 	return c.connected
 }
 
+// instanceUID generates a stable UUID from the agent ID using MD5 hash.
 func (c *Client) instanceUID() [16]byte {
 	var uid [16]byte
-	copy(uid[:], []byte(c.config.AgentID))
+	h := md5.Sum([]byte(c.config.AgentID))
+	copy(uid[:], h[:])
 	return uid
 }
 
