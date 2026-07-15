@@ -85,7 +85,8 @@ func (c *Client) Start(ctx context.Context) error {
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_ReportsHealth |
 		protobufs.AgentCapabilities_AgentCapabilities_ReportsEffectiveConfig |
 		protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus |
-		protobufs.AgentCapabilities_AgentCapabilities_AcceptsRestartCommand
+		protobufs.AgentCapabilities_AgentCapabilities_AcceptsRestartCommand |
+		protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig
 
 	settings := opampcltypes.StartSettings{
 		OpAMPServerURL: c.config.Endpoint,
