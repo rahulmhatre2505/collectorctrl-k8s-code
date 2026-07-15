@@ -5,10 +5,12 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,8 +37,9 @@ import (
 // CollectorMonitorReconciler reconciles a CollectorMonitor object.
 type CollectorMonitorReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	Clientset kubernetes.Interface
 
 	// opampClients holds one OpAMP client per CollectorMonitor CR.
 	opampClients map[string]*opamp.Client
@@ -54,6 +58,7 @@ type CollectorMonitorReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;deployments;statefulsets,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
@@ -299,6 +304,18 @@ func (r *CollectorMonitorReconciler) ensureOpAMPConnection(ctx context.Context, 
 			_ = client.SendEmergencyAck(false, err.Error())
 		} else {
 			_ = client.SendEmergencyAck(true, "")
+		}
+	})
+
+	// Handle logs request
+	client.OnFetchLogs(func(podName string) {
+		log.FromContext(ctx).Info("Received logs request from server", "podName", podName)
+		logs, err := r.getPodLogs(ctx, monitor.Namespace, podName)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Failed to get pod logs", "podName", podName)
+			_ = client.SendPodLogs(podName, "", false, err.Error())
+		} else {
+			_ = client.SendPodLogs(podName, logs, true, "")
 		}
 	})
 
@@ -595,4 +612,27 @@ func (r *CollectorMonitorReconciler) cleanupOpAMPClient(ns, name string) {
 		delete(r.opampClients, key)
 	}
 	delete(r.opampStarted, key)
+}
+
+// getPodLogs fetches the logs of a collector pod in the specified namespace.
+func (r *CollectorMonitorReconciler) getPodLogs(ctx context.Context, namespace, podName string) (string, error) {
+	if r.Clientset == nil {
+		return "", fmt.Errorf("clientset not initialized")
+	}
+	tailLines := int64(100)
+	req := r.Clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+		TailLines: &tailLines,
+	})
+	podLogs, err := req.Stream(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer podLogs.Close()
+
+	buf := new(bytes.Buffer)
+	_, err = io.Copy(buf, podLogs)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }

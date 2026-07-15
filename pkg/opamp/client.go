@@ -43,6 +43,7 @@ type Client struct {
 
 	onConfigUpdate func(ConfigUpdate)
 	onEmergencyCmd func(EmergencyCommand)
+	onFetchLogs    func(string)
 }
 
 // ConfigUpdate is sent by the server to push a new configuration.
@@ -71,6 +72,11 @@ func (c *Client) OnConfigUpdate(fn func(ConfigUpdate)) {
 // OnEmergencyCmd registers a handler for emergency override commands.
 func (c *Client) OnEmergencyCmd(fn func(EmergencyCommand)) {
 	c.onEmergencyCmd = fn
+}
+
+// OnFetchLogs registers a handler for retrieving collector pod logs.
+func (c *Client) OnFetchLogs(fn func(string)) {
+	c.onFetchLogs = fn
 }
 
 // Start establishes the OpAMP connection.
@@ -211,6 +217,25 @@ func (c *Client) SendEmergencyAck(success bool, errMsg string) error {
 	return err
 }
 
+// SendPodLogs sends the fetched pod logs back to the server.
+func (c *Client) SendPodLogs(podName string, logs string, success bool, errMsg string) error {
+	if c.client == nil {
+		return fmt.Errorf("client not started")
+	}
+	var data string
+	if success {
+		data = fmt.Sprintf("fetch_logs_ack:%s:true:%s", podName, logs)
+	} else {
+		data = fmt.Sprintf("fetch_logs_ack:%s:false:%s", podName, errMsg)
+	}
+	_, err := c.client.SendCustomMessage(&protobufs.CustomMessage{
+		Capability: "collectorctrl",
+		Type:       "fetch_logs_response",
+		Data:       []byte(data),
+	})
+	return err
+}
+
 // Connected returns true if the client is connected.
 func (c *Client) Connected() bool {
 	c.connMu.RLock()
@@ -282,21 +307,26 @@ func (c *Client) onMessage(ctx context.Context, msg *opampcltypes.MessageData) {
 		}
 	}
 
-	if msg.CustomMessage != nil && c.onEmergencyCmd != nil {
+	if msg.CustomMessage != nil {
 		cm := msg.CustomMessage
-		if strings.EqualFold(cm.Type, "emergency") && strings.EqualFold(cm.Capability, "collectorctrl") {
-			data := string(cm.Data)
-			parts := strings.SplitN(data, "\n---\n", 2)
-			reason := "emergency override"
-			configYAML := data
-			if len(parts) == 2 {
-				reason = strings.TrimSpace(strings.TrimPrefix(parts[0], "emergency:"))
-				configYAML = parts[1]
+		if strings.EqualFold(cm.Capability, "collectorctrl") {
+			if strings.EqualFold(cm.Type, "emergency") && c.onEmergencyCmd != nil {
+				data := string(cm.Data)
+				parts := strings.SplitN(data, "\n---\n", 2)
+				reason := "emergency override"
+				configYAML := data
+				if len(parts) == 2 {
+					reason = strings.TrimSpace(strings.TrimPrefix(parts[0], "emergency:"))
+					configYAML = parts[1]
+				}
+				c.onEmergencyCmd(EmergencyCommand{
+					ConfigYAML: configYAML,
+					Reason:     reason,
+				})
+			} else if strings.EqualFold(cm.Type, "fetch_logs") && c.onFetchLogs != nil {
+				podName := string(cm.Data)
+				c.onFetchLogs(podName)
 			}
-			c.onEmergencyCmd(EmergencyCommand{
-				ConfigYAML: configYAML,
-				Reason:     reason,
-			})
 		}
 	}
 }

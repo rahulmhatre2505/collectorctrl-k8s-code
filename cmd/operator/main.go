@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -59,11 +60,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create kubernetes clientset")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.CollectorMonitorReconciler{
 		Client:           mgr.GetClient(),
 		Scheme:           mgr.GetScheme(),
 		Recorder:         mgr.GetEventRecorderFor("collectorctrl-operator"),
 		DefaultSecretKey: os.Getenv("OPAMP_SECRET_KEY"),
+		Clientset:        clientset,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CollectorMonitor")
 		os.Exit(1)
