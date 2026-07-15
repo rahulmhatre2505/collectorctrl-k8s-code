@@ -60,9 +60,10 @@ func main() {
 	}
 
 	if err = (&controllers.CollectorMonitorReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("collectorctrl-operator"),
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Recorder:         mgr.GetEventRecorderFor("collectorctrl-operator"),
+		DefaultSecretKey: os.Getenv("OPAMP_SECRET_KEY"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CollectorMonitor")
 		os.Exit(1)

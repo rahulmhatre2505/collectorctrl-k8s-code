@@ -83,7 +83,7 @@ func (v *Validator) Validate(configYAML string) *Result {
 	}
 
 	// 4. Check for unknown components
-	for section := range []string{"receivers", "processors", "exporters", "extensions"} {
+	for _, section := range []string{"receivers", "processors", "exporters", "extensions"} {
 		if components, ok := root[section].(map[string]interface{}); ok {
 			for name := range components {
 				componentName := strings.Split(name, "/")[0] // strip named variant
@@ -158,7 +158,7 @@ func defaultKnownComponents() map[string]bool {
 		"transform": true, "tail_sampling": true, "group_by_attrs": true,
 
 		// Exporters
-		"debug": true, "otlp": true, "otlphttp": true,
+		"debug": true, "otlphttp": true,
 		"splunk_hec": true, "splunk_hec_logs": true,
 		"prometheusremotewrite": true, "loki": true, "datadog": true,
 

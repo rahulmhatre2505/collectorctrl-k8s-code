@@ -22,7 +22,9 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	collectorctrlv1alpha1 "github.com/collectorctrl/collectorctrl/operator/api/v1alpha1"
 	"github.com/collectorctrl/collectorctrl/pkg/api"
@@ -41,6 +43,9 @@ type CollectorMonitorReconciler struct {
 	// opampRunning prevents multiple connections for the same CR.
 	opampMu      sync.Mutex
 	opampStarted map[string]bool
+
+	// DefaultSecretKey is the fallback OpAMP secret key from the environment.
+	DefaultSecretKey string
 }
 
 // +kubebuilder:rbac:groups=collectorctrl.io,resources=collectormonitors,verbs=get;list;watch;create;update;patch;delete
@@ -259,6 +264,10 @@ func (r *CollectorMonitorReconciler) ensureOpAMPConnection(ctx context.Context, 
 		}
 		cfg.Headers = map[string]string{
 			"Authorization": fmt.Sprintf("Secret-Key %s", string(secret.Data[keyName])),
+		}
+	} else if r.DefaultSecretKey != "" {
+		cfg.Headers = map[string]string{
+			"Authorization": fmt.Sprintf("Secret-Key %s", r.DefaultSecretKey),
 		}
 	}
 
@@ -534,8 +543,44 @@ func (r *CollectorMonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&collectorctrlv1alpha1.CollectorMonitor{}).
-		Owns(&corev1.ConfigMap{}).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.mapConfigMapToMonitors)).
 		Complete(r)
+}
+
+func (r *CollectorMonitorReconciler) mapConfigMapToMonitors(ctx context.Context, obj client.Object) []reconcile.Request {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		return nil
+	}
+
+	var list collectorctrlv1alpha1.CollectorMonitorList
+	if err := r.List(ctx, &list, client.InNamespace(cm.Namespace)); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, monitor := range list.Items {
+		// Match by resolved ConfigMapRef name
+		if monitor.Status.ConfigMapRef != nil && monitor.Status.ConfigMapRef.Name == cm.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: monitor.Namespace,
+					Name:      monitor.Name,
+				},
+			})
+			continue
+		}
+		// Match by Spec ConfigMapSelector if not yet resolved
+		if monitor.Spec.ConfigMapSelector != nil && monitor.Spec.ConfigMapSelector.Name == cm.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: monitor.Namespace,
+					Name:      monitor.Name,
+				},
+			})
+		}
+	}
+	return requests
 }
 
 // cleanupOpAMPClient closes the OpAMP connection for a deleted CollectorMonitor.

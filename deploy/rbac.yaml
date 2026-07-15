@@ -23,6 +23,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "update", "patch"]
+  # Secrets (read for OpAMP authentication)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
   # Pods and exec
   - apiGroups: [""]
     resources: ["pods"]
